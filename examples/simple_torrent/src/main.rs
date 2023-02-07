@@ -20,12 +20,12 @@ use bip_disk::{DiskManagerBuilder, BlockMetadata, Block, BlockMut, IDiskMessage,
 use bip_disk::fs::NativeFileSystem;
 use bip_disk::fs_cache::FileHandleCache;
 //use bip_dht::{DhtBuilder, Handshaker, Router};
-use bip_handshake::{HandshakerBuilder, PeerId, InitiateMessage, Protocol, HandshakerConfig};
+use bip_handshake::{HandshakerBuilder, PeerId, InitiateMessage, Protocol, HandshakerConfig, Extensions};
 use bip_handshake::transports::TcpTransport;
 use bip_peer::{PeerManagerBuilder, IPeerManagerMessage, PeerInfo, PeerProtocolCodec, OPeerManagerMessage};
 use bip_peer::protocols::{PeerWireProtocol, NullProtocol};
-use bip_peer::message::{HaveMessage, BitFieldMessage, PeerWireProtocolMessage, PieceMessage, RequestMessage};
-use bip_metainfo::{MetainfoFile, InfoDictionary};
+use bip_peer::messages::{HaveMessage, BitFieldMessage, PeerWireProtocolMessage, PieceMessage, RequestMessage};
+use bip_metainfo::{Metainfo, Info};
 use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead,};
 use futures::{future, stream, Future, Stream, Sink};
@@ -38,7 +38,7 @@ use futures::future::{Loop, Either};
       * We will unconditionally upload pieces to a peer (regardless whether or not they were choked)
       * We dont add an info hash filter to bip_handshake after we have as many peers as we need/want
       * We dont do any banning of malicious peers
-      
+
     Things the example doesnt do, unrelated to bip_select:
       * Matching peers up to disk requests isnt as good as it could be
       * Doesnt use a shared BytesMut for servicing piece requests
@@ -114,8 +114,9 @@ fn main() {
     File::open(file).unwrap().read_to_end(&mut metainfo_bytes).unwrap();
 
     // Parse out our torrent file
-    let metainfo = MetainfoFile::from_bytes(metainfo_bytes).unwrap();
-    let info_hash = metainfo.info_hash();
+    let metainfo = Metainfo::from_bytes(metainfo_bytes).unwrap();
+    let info_hash = metainfo.info().info_hash();
+
 
     // Create our main "core" event loop
     let mut core = Core::new().unwrap();
@@ -142,7 +143,7 @@ fn main() {
         .with_config(HandshakerConfig::default()
             .with_wait_buffer_size(0)
             .with_done_buffer_size(0))
-        .build::<TcpTransport>(core.handle()) // Will handshake over TCP (could swap this for UTP in the future)
+        .build::<TcpTransport>(TcpTransport, core.handle()) // Will handshake over TCP (could swap this for UTP in the future)
         .unwrap()
         .into_parts();
     // Create a peer manager that will hold our peers and heartbeat/send messages to them
@@ -164,9 +165,9 @@ fn main() {
             let (_, _, hash, pid, addr, sock) = complete_msg.into_parts();
             // Frame our socket with the peer wire protocol with no extensions (nested null protocol), and a max payload of 24KB
             let peer = sock.framed(PeerProtocolCodec::with_max_payload(PeerWireProtocol::new(NullProtocol::new()), 24 * 1024));
-            
+
             // Create our peer identifier used by our peer manager
-            let peer_info = PeerInfo::new(addr, pid, hash);
+            let peer_info = PeerInfo::new(addr, pid, hash, Extensions::new());
 
             // Map to a message that can be fed to our peer manager
             IPeerManagerMessage::AddPeer(peer_info, peer)
@@ -257,7 +258,7 @@ fn main() {
                         let mut request_map_mut = disk_request_map.borrow_mut();
                         let mut peer_list = request_map_mut.get_mut(&metadata).unwrap();
                         let peer_info = peer_list.remove(1);
-                        
+
                         // Pack up our block into a peer wire protocol message and send it off to the peer
                         let piece = PieceMessage::new(metadata.piece_index() as u32, metadata.block_offset() as u32, block.freeze());
                         let pwp_message = PeerWireProtocolMessage::Piece(piece);
@@ -288,7 +289,7 @@ fn main() {
     );
 
     // Generate data structure to track the requests we need to make, the requests that have been fulfilled, and an active peers list
-    let piece_requests = generate_requests(metainfo.info(), 16 * 1024);
+    let piece_requests = generate_requests(&metainfo.info(), 16 * 1024);
 
     // Have our disk manager allocate space for our torrent and start tracking it
     core.run(disk_manager_send.send(IDiskMessage::AddTorrent(metainfo.clone()))).unwrap();
@@ -368,7 +369,7 @@ fn main() {
                             // pieces we have. We dont handle bad pieces here (since we deleted our request
                             // but ideally, we would recreate those requests and resend/blacklist the peer).
                             cur_pieces += 1;
-                            
+
                             if let Some(peer) = opt_peer {
                                 // Send our have message back to the peer
                                 vec![IPeerManagerMessage::SendMessage(peer, 0, PeerWireProtocolMessage::Have(HaveMessage::new(piece as u32)))]
@@ -427,9 +428,9 @@ fn main() {
 /// Generate a mapping of piece index to list of block requests for that piece, given a block size.
 ///
 /// Note, most clients will drop connections for peers requesting block sizes above 16KB.
-fn generate_requests(info: &InfoDictionary, block_size: usize) -> Vec<RequestMessage> {
+fn generate_requests(info: &Info, block_size: usize) -> Vec<RequestMessage> {
     let mut requests = Vec::new();
-    
+
     // Grab our piece length, and the sum of the lengths of each file in the torrent
     let piece_len: u64 = info.piece_length();
     let mut total_file_length: u64 = info.files().map(|file| file.length()).sum();
